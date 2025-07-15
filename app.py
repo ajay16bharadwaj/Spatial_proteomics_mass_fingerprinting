@@ -1,8 +1,9 @@
-from nicegui import ui
+from nicegui import ui, app
 from io import BytesIO
 import traceback
 import base64
 import matplotlib.pyplot as plt
+import asyncio
 
 # Import the class from the other file
 from spatial_mass_fingerprinter import SpatialMassFingerprinter
@@ -47,9 +48,16 @@ async def run_analysis():
     download_button.visible = False
     filter_input.visible = False
     filter_input.value = ''
-
+    
+    # Show spinner and set initial status
+    analysis_spinner.visible = True
+    analysis_status.text = 'Analysis in progress...'
+    analysis_status.visible = True
 
     try:
+        # Give the UI a moment to update before starting the heavy work
+        await asyncio.sleep(0.1)
+
         # Reset file stream pointers to the beginning
         uploaded_files["peak_list"].seek(0)
         uploaded_files["psm_data"].seek(0)
@@ -60,46 +68,78 @@ async def run_analysis():
         # Assign the UI log to the fingerprinter instance
         fingerprinter.set_logger(log)
         
-        # Use a spinner to indicate that the app is busy
-        with ui.spinner(size='lg', color='primary'):
-            # Load data
-            fingerprinter.load_data_from_stream(
-                peak_file_stream=uploaded_files["peak_list"],
-                psm_file_stream=uploaded_files["psm_data"],
-                psm_file_name=uploaded_files["psm_name"]
-            )
-
-            # Set parameters
-            fingerprinter.set_parameters(
-                ppm_tolerance=ppm_input.value,
-                hyperscore_threshold=hyperscore_input.value,
-                charge_states=charge_states_list
-            )
-            
-            # Run the main analysis
-            results_df = fingerprinter.perform_fingerprinting()
+        # These parts are fast, so they can run directly
+        fingerprinter.load_data_from_stream(
+            peak_file_stream=uploaded_files["peak_list"],
+            psm_file_stream=uploaded_files["psm_data"],
+            psm_file_name=uploaded_files["psm_name"]
+        )
+        fingerprinter.set_parameters(
+            ppm_tolerance=ppm_input.value,
+            hyperscore_threshold=hyperscore_input.value,
+            charge_states=charge_states_list
+        )
+        
+        # The analysis is still run here, but the `await asyncio.sleep(0.1)`
+        # gives the browser time to render the spinner before this blocks.
+        results_df = fingerprinter.perform_fingerprinting()
 
         # Display results table
         if not results_df.empty:
             table_df = results_df.reset_index()
-            cols = [{'name': col, 'label': col, 'field': col, 'sortable': True} for col in table_df.columns]
+
+            # Define the desired column order and new names
+            column_mapping = {
+                'MALDI M/Z Value': 'MALDI M/Z Value',
+                'Mass Error (ppm)': 'Mass Error',
+                'Calibrated Observed Mass': 'Calibrated Observed Mass',
+                'Protein Description': 'Protein Description',
+                'Gene': 'Gene',
+                'Modified Peptide': 'Peptide with Modifications',
+                'Charge': 'Charge',
+                'Ion Mobility': 'Ion Mobility',
+                'Retention': 'Retention',
+                'Calculated M/Z': 'Calculated M/Z',
+                'Hyperscore': 'Hyperscore',
+                'Nextscore': 'Nextscore'
+            }
+
+            # Get the list of columns to display first, ensuring they exist in the dataframe
+            ordered_cols = [col for col in column_mapping.keys() if col in table_df.columns]
+            
+            # Get the remaining columns
+            remaining_cols = [col for col in table_df.columns if col not in ordered_cols]
+            
+            # Combine the lists to get the final column order
+            final_col_order = ordered_cols + remaining_cols
+            
+            # Reorder the dataframe
+            display_df = table_df[final_col_order]
+            
+            # Rename the columns for display
+            display_df = display_df.rename(columns=column_mapping)
+
+            # Create the table definition for niceGUI
+            cols = [{'name': col, 'label': col, 'field': col, 'sortable': True} for col in display_df.columns]
+            
             with results_table:
-                # Create the table with pagination and bind the filter
-                table = ui.table(columns=cols, rows=table_df.to_dict('records'), row_key='Peptide', pagination=25).classes('w-full')
+                # The row_key must match a column name *after* renaming
+                row_key = 'Peptide with Modifications' if 'Peptide with Modifications' in display_df.columns else 'Peptide'
+                table = ui.table(columns=cols, rows=display_df.to_dict('records'), row_key=row_key, pagination=25).classes('w-full')
                 table.bind_filter_from(filter_input, 'value')
             
             download_button.visible = True
-            filter_input.visible = True # Show the search bar
+            filter_input.visible = True
 
         # Generate and display plots
+        analysis_status.text = 'Generating visualizations...'
         log.push("Generating visualizations...")
         
-        # Correctly display plots by converting them to base64 images
         with plot_area_1:
             fig = fingerprinter.plot_mass_error_distribution()
             buf = BytesIO()
             fig.savefig(buf, format='png', bbox_inches='tight')
-            plt.close(fig)  # Close the figure to free up memory
+            plt.close(fig)
             b64_str = base64.b64encode(buf.getvalue()).decode('utf-8')
             ui.image(f'data:image/png;base64,{b64_str}')
 
@@ -120,13 +160,17 @@ async def run_analysis():
             ui.image(f'data:image/png;base64,{b64_str}')
 
         log.push("Done.")
+        analysis_status.text = 'Analysis complete. Please check results below.'
         ui.notify("Analysis finished successfully!", color='positive')
 
     except Exception as e:
-        # Catch any exception during the process and log it
         tb = traceback.format_exc()
         log.push(f"--- ANALYSIS FAILED ---\n{tb}")
         ui.notify(f"An error occurred: {e}", color='negative', multi_line=True)
+        analysis_status.text = 'Analysis failed.'
+    finally:
+        # Ensure the spinner is always hidden at the end
+        analysis_spinner.visible = False
 
 
 @ui.page('/')
@@ -134,6 +178,7 @@ def main_page():
     """Defines the UI layout and elements."""
     global peak_upload_label, psm_upload_label, ppm_input, hyperscore_input, charge_states_input
     global results_table, download_button, plot_area_1, plot_area_2, plot_area_3, log, filter_input
+    global analysis_spinner, analysis_status
     
     ui.add_head_html('<style>body {background-color: #f4f4f8;}</style>')
     
@@ -157,19 +202,23 @@ def main_page():
             charge_states_input = ui.input(label='Charge States (comma-separated)', value='1,2').classes('flex-1')
 
     with ui.card().classes('w-full max-w-4xl mx-auto mt-6'):
-        ui.button('Run Analysis', on_click=run_analysis, icon='science').props('color=primary size=lg')
+        with ui.row().classes('items-center gap-4'):
+            ui.button('Run Analysis', on_click=run_analysis, icon='science').props('color=primary size=lg')
+            analysis_spinner = ui.spinner('primary', size='lg')
+            analysis_status = ui.label()
+        analysis_spinner.visible = False
+        analysis_status.visible = False
 
     with ui.card().classes('w-full max-w-4xl mx-auto mt-6'):
         ui.label('Log').classes('text-xl font-semibold')
         log = ui.log().classes('w-full h-40 bg-gray-100 p-2 rounded')
 
-    with ui.card().classes('w--full max-w-4xl mx-auto mt-6'):
+    with ui.card().classes('w-full max-w-4xl mx-auto mt-6'):
         with ui.row().classes('w-full justify-between items-center'):
             ui.label('3. Results').classes('text-xl font-semibold')
             download_button = ui.button('Download CSV', on_click=lambda: ui.download(get_csv(), 'fingerprinting_results.csv'), icon='download').props('color=secondary')
             download_button.visible = False
         
-        # Input for filtering the table
         filter_input = ui.input(placeholder='Search results...').props('dense clearable').classes('w-full mb-2')
         filter_input.visible = False
         
@@ -187,4 +236,4 @@ def get_csv():
     return df_to_download.to_csv(index=False).encode()
 
 # Run the app
-ui.run()
+ui.run(host='0.0.0.0')
